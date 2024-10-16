@@ -1,17 +1,33 @@
 import { Hono } from "hono";
-import { and, asc, countDistinct, desc, eq, sql } from "drizzle-orm";
+import { HTTPException } from "hono/http-exception";
+import {
+  and,
+  asc,
+  countDistinct,
+  desc,
+  eq,
+  exists,
+  isNull,
+  sql,
+} from "drizzle-orm";
 
 import { db } from "@/adapter";
 import type { Context } from "@/context";
 import { userTable } from "@/db/schemas/auth";
+import { commentsTable } from "@/db/schemas/comments";
 import { postsTable } from "@/db/schemas/posts";
 import { postUpvotesTable } from "@/db/schemas/upvotes";
 import { loggedIn } from "@/middleware/loggedIn";
 import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
 
 import {
+  createCommentSchema,
   createPostSchema,
   paginationSchema,
+  type Comment,
+  type PaginatedResponse,
+  type Post,
   type SuccessResponse,
 } from "@/shared/types";
 import { getISOFormatDateQuery } from "@/lib/utils";
@@ -89,4 +105,193 @@ export const postRouter = new Hono<Context>()
           site ? eq(postsTable.url, site) : undefined,
         ),
       );
-  });
+
+    if (user) {
+      postsQuery.leftJoin(
+        postUpvotesTable,
+        and(
+          eq(postUpvotesTable.postId, postsTable.id),
+          eq(postUpvotesTable.userId, user.id),
+        ),
+      );
+    }
+
+    const posts = await postsQuery;
+
+    return c.json<PaginatedResponse<Post[]>>(
+      {
+        data: posts as Post[],
+        success: true,
+        message: "Posts fetched",
+        pagination: {
+          page: page,
+          totalPages: Math.ceil(count.count / limit) as number,
+        },
+      },
+      200,
+    );
+  })
+  .post(
+    "/:id/upvote",
+    loggedIn,
+    zValidator("param", z.object({ id: z.coerce.number() })),
+    async (c) => {
+      const { id } = c.req.valid("param");
+
+      const user = c.get("user")!;
+
+      let pointsChange: -1 | 1 = 1;
+
+      const points = await db.transaction(async (tx) => {
+        const [existingUpvote] = await tx
+          .select()
+          .from(postUpvotesTable)
+          .where(
+            and(
+              eq(postUpvotesTable.postId, id),
+              eq(postUpvotesTable.userId, user.id),
+            ),
+          )
+          .limit(1);
+
+        pointsChange = existingUpvote ? -1 : 1;
+
+        const [updated] = await tx
+          .update(postsTable)
+          .set({
+            points: sql`${postsTable.points} + ${pointsChange}`,
+          })
+          .where(eq(postsTable.id, id))
+          .returning({ points: postsTable.points });
+
+        if (!updated) {
+          throw new HTTPException(404, { message: "Post not found!" });
+        }
+
+        if (existingUpvote) {
+          await tx
+            .delete(postUpvotesTable)
+            .where(and(eq(postUpvotesTable.postId, existingUpvote.id)));
+        } else {
+          await tx.insert(postUpvotesTable).values({
+            postId: id,
+            userId: user.id,
+          });
+        }
+
+        return updated.points;
+      });
+
+      return c.json<SuccessResponse<{ count: number; isUpvoted: boolean }>>(
+        {
+          success: true,
+          message: "Post updated",
+          data: { count: points, isUpvoted: pointsChange > 0 },
+        },
+        200,
+      );
+    },
+  )
+  .post(
+    "/:id/comment",
+    loggedIn,
+    zValidator("param", z.object({ id: z.coerce.number() })),
+    zValidator("form", createCommentSchema),
+    async (c) => {
+      const { id } = c.req.valid("param");
+      const { content } = c.req.valid("form");
+      const user = c.get("user")!;
+
+      const [comment] = await db.transaction(async (tx) => {
+        const [updated] = await tx
+          .update(postsTable)
+          .set({ commentCount: sql`${postsTable.commentCount} + 1` })
+          .where(eq(postsTable.id, id))
+          .returning({ commentCount: postsTable.commentCount });
+
+        if (!updated) {
+          throw new HTTPException(404, { message: "Post not found!" });
+        }
+
+        return await tx
+          .insert(commentsTable)
+          .values({
+            content,
+            userId: user.id,
+            postId: id,
+          })
+          .returning({
+            id: commentsTable.id,
+            userId: commentsTable.userId,
+            postId: commentsTable.postId,
+            content: commentsTable.content,
+            points: commentsTable.points,
+            depth: commentsTable.depth,
+            parentCommentId: commentsTable.parentCommentId,
+            createdAt: getISOFormatDateQuery(commentsTable.createdAt).as(
+              "created_at",
+            ),
+            commentCount: commentsTable.commentCount,
+          });
+      });
+
+      return c.json<SuccessResponse<Comment>>({
+        success: true,
+        message: "Comment created",
+        data: {
+          ...comment,
+          commentUpvotes: [],
+          childComments: [],
+          author: {
+            username: user.username,
+            id: user.id,
+          },
+        } as Comment,
+      });
+    },
+  )
+  .get(
+    "/:id/comments",
+    zValidator("param", z.object({ id: z.coerce.number() })),
+    zValidator(
+      "query",
+      paginationSchema
+        .extend({ includeChildren: z.boolean({ coerce: true }) })
+        .optional(),
+    ),
+    async (c) => {
+      const user = c.get("user")!;
+      const { id } = c.req.valid("param");
+      const { limit, page, sortBy, order, includeChildren } =
+        c.req.valid("query");
+
+      const [postsExists] = await db
+        .select({ exists: sql`1` })
+        .from(postsTable)
+        .where(eq(postsTable.id, id))
+        .limit(1);
+
+      if (!postsExists) {
+        throw new HTTPException(404, { message: "Post not found!" });
+      }
+
+      const sortByColumn =
+        sortBy === "points" ? commentsTable.points : commentsTable.createdAt;
+      const sortOrder =
+        order === "desc" ? desc(sortByColumn) : asc(sortByColumn);
+
+      const [count] = await db
+        .select({
+          count: countDistinct(commentsTable.id),
+        })
+        .from(commentsTable)
+        .where(
+          and(
+            eq(commentsTable.postId, id),
+            isNull(commentsTable.parentCommentId),
+          ),
+        );
+
+        const comments = await db.query 
+    },
+  );
