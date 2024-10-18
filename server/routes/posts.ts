@@ -292,6 +292,6 @@ export const postRouter = new Hono<Context>()
           ),
         );
 
-        const comments = await db.query 
+      const comments = await db.query.comments.findMany({});
     },
   );
